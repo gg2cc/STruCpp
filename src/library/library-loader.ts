@@ -18,6 +18,7 @@ import { DuplicateSymbolError } from "../semantic/symbol-table.js";
 import type {
   ElementaryType,
   IECType,
+  ArrayType,
   StructDefinition,
   StructType,
   TypeReference,
@@ -74,6 +75,21 @@ function makeTypeRef(v: LibraryVarType): TypeReference {
 function buildLibraryTypeDefinition(
   t: LibraryTypeEntry,
 ): StructDefinition | TypeReference {
+  const makeFieldType = (
+    field: NonNullable<LibraryTypeEntry["fields"]>[number],
+  ): TypeReference => {
+    const type: TypeReference = {
+      kind: "TypeReference",
+      sourceSpan: createDefaultSourceSpan(),
+      name: field.type,
+      isReference: false,
+      referenceKind: "none",
+    };
+    if (field.arrayDimensions) type.arrayDimensions = field.arrayDimensions;
+    if (field.elementTypeName) type.elementTypeName = field.elementTypeName;
+    return type;
+  };
+
   if (t.kind === "struct" && t.fields && t.fields.length > 0) {
     return {
       kind: "StructDefinition",
@@ -82,34 +98,27 @@ function buildLibraryTypeDefinition(
         kind: "VarDeclaration" as const,
         sourceSpan: createDefaultSourceSpan(),
         names: [f.name],
-        type: {
-          kind: "TypeReference" as const,
-          sourceSpan: createDefaultSourceSpan(),
-          name: f.type,
-          isReference: false,
-          referenceKind: "none" as const,
-        },
+        type: makeFieldType(f),
       })),
     };
   }
-  return {
+  const type: TypeReference = {
     kind: "TypeReference",
     sourceSpan: createDefaultSourceSpan(),
     name: t.baseType ?? t.name,
     isReference: false,
     referenceKind: "none",
   };
+  if (t.arrayDimensions) type.arrayDimensions = t.arrayDimensions;
+  if (t.elementTypeName) type.elementTypeName = t.elementTypeName;
+  return type;
 }
 
 function makeVarSymbol(
   v: LibraryVarType,
   direction: "input" | "output" | "inout" | "local",
 ): VariableSymbol {
-  const varType: ElementaryType = ELEMENTARY_TYPES[v.type.toUpperCase()] ?? {
-    typeKind: "elementary",
-    name: v.type,
-    sizeBits: 0,
-  };
+  const varType = resolveLibraryTypeMetadata(v);
   const declaration: VarDeclaration = {
     kind: "VarDeclaration",
     sourceSpan: createDefaultSourceSpan(),
@@ -134,6 +143,32 @@ function makeVarSymbol(
     // prefers it over re-deriving the rule against the wrong unit.
     ...(v.cppName !== undefined ? { cppName: v.cppName } : {}),
   };
+}
+
+function resolveLibraryTypeMetadata(type: {
+  type: string;
+  arrayDimensions?: Array<{ start: number; end: number }>;
+  elementTypeName?: string;
+}): IECType {
+  if (type.arrayDimensions && type.elementTypeName) {
+    return {
+      typeKind: "array",
+      elementType: ELEMENTARY_TYPES[type.elementTypeName.toUpperCase()] ?? {
+        typeKind: "elementary",
+        name: type.elementTypeName,
+        sizeBits: 0,
+      },
+      dimensions: type.arrayDimensions,
+    } as ArrayType;
+  }
+  return (
+    ELEMENTARY_TYPES[type.type.toUpperCase()] ??
+    ({
+      typeKind: "elementary",
+      name: type.type,
+      sizeBits: 0,
+    } as ElementaryType)
+  );
 }
 
 /**
@@ -363,23 +398,18 @@ export function registerLibrarySymbols(
             typeKind: "struct",
             name: t.name,
             fields: new Map<string, IECType>(
-              t.fields.map((f) => [
-                f.name,
-                ELEMENTARY_TYPES[f.type.toUpperCase()] ??
-                  ({
-                    typeKind: "elementary",
-                    name: f.type,
-                    sizeBits: 0,
-                  } as ElementaryType),
-              ]),
+              t.fields.map((f) => [f.name, resolveLibraryTypeMetadata(f)]),
             ),
           } as StructType)
-        : (ELEMENTARY_TYPES[t.name.toUpperCase()] ??
-          ({
-            typeKind: "elementary",
-            name: t.name,
-            sizeBits: 0,
-          } as ElementaryType));
+        : resolveLibraryTypeMetadata({
+            type: t.name,
+            ...(t.arrayDimensions
+              ? { arrayDimensions: t.arrayDimensions }
+              : {}),
+            ...(t.elementTypeName
+              ? { elementTypeName: t.elementTypeName }
+              : {}),
+          });
 
     try {
       symbolTables.globalScope.define({

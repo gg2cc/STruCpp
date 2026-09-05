@@ -169,10 +169,18 @@ export interface LibraryTypeEntry {
   kind: "struct" | "enum" | "alias";
   /** Base type (for alias/enum) */
   baseType?: string;
+  /** Fixed dimensions and element type for a named array type. */
+  arrayDimensions?: Array<{ start: number; end: number }>;
+  elementTypeName?: string;
   /** Struct member fields (name + declared type), so a consuming compilation
    *  can type member access on a dependency struct (e.g. `MATH.PI`). Only set
    *  for `kind: "struct"`; optional for backward compatibility. */
-  fields?: Array<{ name: string; type: string }>;
+  fields?: Array<{
+    name: string;
+    type: string;
+    arrayDimensions?: Array<{ start: number; end: number }>;
+    elementTypeName?: string;
+  }>;
   /** Type-level help text — same lifecycle as `LibraryFBEntry.documentation`,
    *  populated automatically from the structured doc-block slot in CODESYS
    *  imports (typically the type's revision-history comment for OSCAT) and

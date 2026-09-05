@@ -220,6 +220,57 @@ END_CONFIGURATION
     }
   });
 
+  it("expands arrays declared inside a dependency library struct", () => {
+    const built = compileLibrary(
+      [
+        {
+          fileName: "library-types.st",
+          source: `
+TYPE
+  NamedValues : ARRAY[0..1] OF DINT;
+  LibraryData : STRUCT
+    inlineValues : ARRAY[1..2] OF DINT;
+    namedValues : NamedValues;
+  END_STRUCT;
+END_TYPE
+`,
+        },
+      ],
+      { name: "array-library", version: "1.0.0", namespace: "arraylib" },
+    );
+    expect(built.success).toBe(true);
+    expect(built.errors).toEqual([]);
+
+    const result = compile(
+      `PROGRAM main
+  VAR
+    data : LibraryData;
+  END_VAR
+  data.inlineValues[1] := 10;
+  data.namedValues[0] := 20;
+END_PROGRAM
+
+CONFIGURATION Config0
+  RESOURCE Res0 ON PLC
+    TASK t(INTERVAL := T#20ms, PRIORITY := 1);
+    PROGRAM p WITH t : main;
+  END_RESOURCE
+END_CONFIGURATION
+`,
+      { libraries: [{ manifest: built.manifest, chunks: built.chunks }] as never },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.errors).toEqual([]);
+    const paths = result.debugMap!.leaves.map((leaf) => leaf.path);
+    expect(paths).toContain("P.DATA.INLINEVALUES[1]");
+    expect(paths).toContain("P.DATA.INLINEVALUES[2]");
+    expect(paths).toContain("P.DATA.NAMEDVALUES[0]");
+    expect(paths).toContain("P.DATA.NAMEDVALUES[1]");
+    expect(result.debugTableCpp).toContain("&g_config.P.DATA.INLINEVALUES[1]");
+    expect(result.debugTableCpp).toContain("&g_config.P.DATA.NAMEDVALUES_[0]");
+  });
+
   it("uses operator() for multi-dimensional array elements", () => {
     // Array2D/Array3D take every index in one operator() call. Emitting a
     // subscript per dimension gives `arr[i][j]`, which has no matching operator

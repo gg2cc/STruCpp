@@ -30,6 +30,7 @@ import type {
   LibraryManifest,
   LibraryVarType,
 } from "./library-manifest.js";
+import { evalIntConst } from "../semantic/type-utils.js";
 import type {
   Expression,
   FunctionBlockDeclaration,
@@ -690,13 +691,47 @@ export function compileLibrary(
       const entry: {
         name: string;
         kind: typeof kind;
-        fields?: Array<{ name: string; type: string }>;
+        arrayDimensions?: Array<{ start: number; end: number }>;
+        elementTypeName?: string;
+        fields?: Array<{
+          name: string;
+          type: string;
+          arrayDimensions?: Array<{ start: number; end: number }>;
+          elementTypeName?: string;
+        }>;
       } = { name: t.name, kind };
+      if (t.definition.kind === "ArrayDefinition") {
+        const dimensions = t.definition.dimensions.map((dimension) => ({
+          start: evalIntConst(dimension.start),
+          end: evalIntConst(dimension.end),
+        }));
+        if (
+          dimensions.every(
+            (dimension) =>
+              dimension.start !== undefined && dimension.end !== undefined,
+          )
+        ) {
+          entry.arrayDimensions = dimensions as Array<{
+            start: number;
+            end: number;
+          }>;
+          entry.elementTypeName = t.definition.elementType.name;
+        }
+      }
       // Export struct member fields so consumers can type `x.field` access
       // on a dependency struct.
       if (t.definition.kind === "StructDefinition") {
         entry.fields = t.definition.fields.flatMap((decl) =>
-          decl.names.map((name) => ({ name, type: decl.type.name })),
+          decl.names.map((name) => ({
+            name,
+            type: decl.type.name,
+            ...(decl.type.arrayDimensions
+              ? { arrayDimensions: decl.type.arrayDimensions }
+              : {}),
+            ...(decl.type.elementTypeName
+              ? { elementTypeName: decl.type.elementTypeName }
+              : {}),
+          })),
         );
       }
       return tagDocumentation(tagCategory(entry, catByName), docByName);

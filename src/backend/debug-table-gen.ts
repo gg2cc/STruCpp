@@ -561,11 +561,29 @@ export function generateDebugTable(
         return;
       }
       // TypeReference alias. The library loader registers library types
-      // with `definition: TypeReference{ name: baseType ?? typeName }` —
+      // with `definition: TypeReference{ name: baseType ?? typeName }`.
+      // A named array carries its dimensions on that TypeReference, so it
+      // must be expanded before the self-reference guard below.
+      if (
+        def.kind === "TypeReference" &&
+        def.arrayDimensions &&
+        def.elementTypeName
+      ) {
+        walkArrayDims(
+          path,
+          cppExpr,
+          def.arrayDimensions,
+          0,
+          def.elementTypeName,
+          flags,
+        );
+        return;
+      }
+      // A non-array TypeReference points at its base; an old struct archive
+      // without exported fields points at itself and remains opaque.
       // an alias points at its base, but a struct with no baseType points
-      // at itself (the manifest doesn't expose struct fields, so the
-      // symbol carries only the type name). Treat self-referential
-      // aliases as opaque library types: the debugger doesn't recurse
+      // at itself. Treat self-referential aliases as opaque library types:
+      // the debugger doesn't recurse
       // into them, just like it doesn't recurse into library FB locals.
       if (def.kind === "TypeReference") {
         if (def.name.toUpperCase() === name) {
