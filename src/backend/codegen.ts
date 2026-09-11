@@ -3334,6 +3334,7 @@ export class CodeGenerator {
     for (const caseElement of stmt.cases) {
       this.emitLineDirective(caseElement.sourceSpan.startLine);
       const caseLabelLine = this.currentLine;
+      const caseLabels: string[] = [];
       for (const label of caseElement.labels) {
         if (label.end) {
           // Range: expand to individual case labels
@@ -3341,29 +3342,40 @@ export class CodeGenerator {
           const endVal = this.evaluateLiteralInt(label.end);
           if (startVal !== undefined && endVal !== undefined) {
             for (let i = startVal; i <= endVal; i++) {
-              this.emit(`${innerIndent}case ${i}:`);
+              caseLabels.push(`case ${i}:`);
             }
           } else {
             // Fallback: emit as comment with expression
-            this.emit(
-              `${innerIndent}case ${this.generateExpression(label.start)}: // range to ${this.generateExpression(label.end)}`,
+            caseLabels.push(
+              `case ${this.generateExpression(label.start)}: // range to ${this.generateExpression(label.end)}`,
             );
           }
         } else {
-          this.emit(
-            `${innerIndent}case ${this.generateExpression(label.start)}:`,
-          );
+          caseLabels.push(`case ${this.generateExpression(label.start)}:`);
         }
+      }
+      for (let i = 0; i < caseLabels.length; i++) {
+        let label = caseLabels[i]!;
+        if (i === caseLabels.length - 1) {
+          const commentIndex = label.indexOf(" //");
+          label =
+            commentIndex === -1
+              ? `${label} {`
+              : `${label.slice(0, commentIndex)} {${label.slice(commentIndex)}`;
+        }
+        this.emit(`${innerIndent}${label}`);
       }
       this.recordLineMapping(caseElement.sourceSpan.startLine, caseLabelLine);
       this.generateStatements(caseElement.statements, bodyIndent);
       this.emit(`${bodyIndent}break;`);
+      this.emit(`${innerIndent}}`);
     }
 
     if (stmt.elseStatements.length > 0) {
-      this.emit(`${innerIndent}default:`);
+      this.emit(`${innerIndent}default: {`);
       this.generateStatements(stmt.elseStatements, bodyIndent);
       this.emit(`${bodyIndent}break;`);
+      this.emit(`${innerIndent}}`);
     }
 
     this.emitLineDirective(stmt.sourceSpan.endLine);

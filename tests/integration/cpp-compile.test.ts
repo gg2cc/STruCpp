@@ -153,6 +153,54 @@ describeIfGpp('C++ Compilation Tests', () => {
     }
   });
 
+  it('scopes CASE branches containing composite-global write temporaries', () => {
+    const source = `
+      TYPE PointData : STRUCT x : INT; END_STRUCT END_TYPE
+      PROGRAM Main
+        VAR_EXTERNAL sharedPoint : PointData; END_VAR
+        VAR state : INT; END_VAR
+        CASE state OF
+          1: sharedPoint.x := 10;
+          2: sharedPoint.x := 20;
+        END_CASE;
+      END_PROGRAM
+      CONFIGURATION Cfg
+        VAR_GLOBAL sharedPoint : PointData; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('case 1: {');
+    expect(result.cppCode).toContain('case 2: {');
+    expect(result.cppCode).toContain('auto __gwv_');
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'case_scoped_global.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(cpp, `${result.cppCode}\n\nint main(){ return 0; }\n`);
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `case_scoped_global_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++ ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
   it('a function block VAR_EXTERNAL touches the SHARED global, not a local copy (threaded + non-threaded)', () => {
     // Regression: an FB's VAR_EXTERNAL used to compile to a plain member (a
     // private copy the FB mutated in isolation). It must instead be a

@@ -14,7 +14,13 @@
 import { describe, it, expect } from "vitest";
 import { compile } from "../../src/index.js";
 
-function compileST(source: string): { cppCode: string; headerCode: string; success: boolean; errors: unknown[]; warnings: unknown[] } {
+function compileST(source: string): {
+  cppCode: string;
+  headerCode: string;
+  success: boolean;
+  errors: unknown[];
+  warnings: unknown[];
+} {
   const result = compile(source);
   return {
     cppCode: result.cppCode,
@@ -147,13 +153,14 @@ describe("Phase 3.2: CASE Statement Code Generation", () => {
     `);
     expect(result.success).toBe(true);
     expect(result.cppCode).toContain("switch (STATE) {");
-    expect(result.cppCode).toContain("case 1:");
+    expect(result.cppCode).toContain("case 1: {");
     expect(result.cppCode).toContain("X = 10;");
     expect(result.cppCode).toContain("break;");
-    expect(result.cppCode).toContain("case 2:");
+    expect(result.cppCode).toContain("case 2: {");
     expect(result.cppCode).toContain("X = 20;");
-    expect(result.cppCode).toContain("case 3:");
+    expect(result.cppCode).toContain("case 3: {");
     expect(result.cppCode).toContain("X = 30;");
+    expect(result.cppCode).toContain("      }\n    }");
   });
 
   it("should generate CASE with multiple labels (fall-through)", () => {
@@ -169,6 +176,7 @@ describe("Phase 3.2: CASE Statement Code Generation", () => {
     expect(result.cppCode).toContain("case 1:");
     expect(result.cppCode).toContain("case 2:");
     expect(result.cppCode).toContain("case 3:");
+    expect(result.cppCode).toContain("case 3: {");
     expect(result.cppCode).toContain("X = 100;");
   });
 
@@ -184,7 +192,7 @@ describe("Phase 3.2: CASE Statement Code Generation", () => {
     expect(result.success).toBe(true);
     expect(result.cppCode).toContain("case 4:");
     expect(result.cppCode).toContain("case 5:");
-    expect(result.cppCode).toContain("case 6:");
+    expect(result.cppCode).toContain("case 6: {");
     expect(result.cppCode).toContain("X = 200;");
   });
 
@@ -200,9 +208,9 @@ describe("Phase 3.2: CASE Statement Code Generation", () => {
       END_PROGRAM
     `);
     expect(result.success).toBe(true);
-    expect(result.cppCode).toContain("case 1:");
+    expect(result.cppCode).toContain("case 1: {");
     expect(result.cppCode).toContain("X = 10;");
-    expect(result.cppCode).toContain("default:");
+    expect(result.cppCode).toContain("default: {");
     expect(result.cppCode).toContain("X = 0;");
   });
 
@@ -666,7 +674,7 @@ describe("Phase 3.2: Complex Control Flow", () => {
     const nsEnd = progSection.indexOf("}  // namespace");
     const funcSection = nsEnd > 0 ? progSection.slice(0, nsEnd) : progSection;
     const lines = funcSection.split("\n");
-    const elseLines = lines.filter(l => l.trim() === "} else {");
+    const elseLines = lines.filter((l) => l.trim() === "} else {");
     expect(elseLines.length).toBe(0);
   });
 
