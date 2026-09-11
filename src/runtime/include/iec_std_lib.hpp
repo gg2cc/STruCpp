@@ -742,6 +742,11 @@ inline ToVal iec_convert_value(FromVal value) noexcept {
     }
 }
 
+template<typename ToVal, typename EnumType>
+inline ToVal iec_convert_value(const IEC_ENUM_Var<EnumType>& value) noexcept {
+    return static_cast<ToVal>(value.get().to_int());
+}
+
 /**
  * Generic type conversion (IECVar → IECVar)
  */
