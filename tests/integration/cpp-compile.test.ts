@@ -579,6 +579,348 @@ describeIfGpp('C++ Compilation Tests', () => {
     expect(cppResult.success).toBe(true);
   });
 
+  it('compiles FUNCTION VAR_OUTPUT directly into composite external fields', () => {
+    const source = `
+      TYPE Quaternion : STRUCT
+        qw : REAL;
+        qx : REAL;
+        qy : REAL;
+        qz : REAL;
+      END_STRUCT END_TYPE
+
+      FUNCTION MakeQuaternion : BOOL
+        VAR_OUTPUT q_w : REAL; q_x : REAL; q_y : REAL; q_z : REAL; END_VAR
+        q_w := 1.0;
+        q_x := 0.0;
+        q_y := 0.0;
+        q_z := 0.0;
+        MakeQuaternion := TRUE;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR_EXTERNAL odom : Quaternion; END_VAR
+        MakeQuaternion(
+          q_w => odom.qw,
+          q_x => odom.qx,
+          q_y => odom.qy,
+          q_z => odom.qz
+        );
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        VAR_GLOBAL odom : Quaternion; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('IEC_REAL __function_arg_');
+    expect(result.cppCode).toContain('ODOM->with_lock(');
+    expect(result.cppCode).not.toMatch(/MAKEQUATERNION\([^\n]*ODOM->with_lock/);
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'func_output_composite.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(cpp, `${result.cppCode}\n\nint main(){ return 0; }\n`);
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `func_output_composite_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++ ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
+  it('copies FUNCTION VAR_IN_OUT through composite external fields', () => {
+    const source = `
+      TYPE CounterData : STRUCT value : INT; END_STRUCT END_TYPE
+
+      FUNCTION Increment : INT
+        VAR_IN_OUT data : CounterData; END_VAR
+        data.value := data.value + 1;
+        Increment := data.value;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR_EXTERNAL shared : CounterData; END_VAR
+        VAR result : INT; END_VAR
+        result := Increment(data := shared);
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        VAR_GLOBAL shared : CounterData; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('COUNTERDATA __function_arg_');
+    expect(result.cppCode).toContain('SHARED->with_lock(');
+    expect(result.cppCode).not.toMatch(/INCREMENT\([^\n]*SHARED->with_lock/);
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'func_inout_composite.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(
+      cpp,
+      `${result.cppCode}\n\nint main(){ strucpp::Program_MAIN p(&strucpp::SHARED); p.run(); return strucpp::SHARED.with_lock([](auto* value){ return value->VALUE; }) == 1 ? 0 : 1; }\n`,
+    );
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `func_inout_composite_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+        execSync(`"${out}"`, { stdio: 'pipe' });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++/run ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
+  it('passes a composite external global by value to FUNCTION VAR_INPUT', () => {
+    const source = `
+      TYPE PairData : STRUCT
+        first : INT;
+        second : INT;
+      END_STRUCT END_TYPE
+
+      FUNCTION SumPair : INT
+        VAR_INPUT data : PairData; END_VAR
+        SumPair := data.first + data.second;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR_EXTERNAL shared : PairData; END_VAR
+        VAR result : INT; END_VAR
+        result := SumPair(shared);
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        VAR_GLOBAL shared : PairData; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('SUMPAIR(SHARED->with_lock(');
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'func_input_composite.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(
+      cpp,
+      `${result.cppCode}\n\nint main(){ strucpp::SHARED.with_lock([](auto* value){ value->FIRST = 2; value->SECOND = 5; }); strucpp::Program_MAIN p(&strucpp::SHARED); p.run(); return p.RESULT == 7 ? 0 : 1; }\n`,
+    );
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `func_input_composite_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+        execSync(`"${out}"`, { stdio: 'pipe' });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++/run ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
+  it('copies a whole composite external global through FUNCTION VAR_OUTPUT', () => {
+    const source = `
+      TYPE PairData : STRUCT
+        first : INT;
+        second : INT;
+      END_STRUCT END_TYPE
+
+      FUNCTION FillPair : BOOL
+        VAR_OUTPUT data : PairData; END_VAR
+        data.first := 3;
+        data.second := 4;
+        FillPair := TRUE;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR_EXTERNAL shared : PairData; END_VAR
+        FillPair(data => shared);
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        VAR_GLOBAL shared : PairData; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('PAIRDATA __function_arg_');
+    expect(result.cppCode).toContain('SHARED->with_lock(');
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'func_output_whole_composite.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(
+      cpp,
+      `${result.cppCode}\n\nint main(){ strucpp::Program_MAIN p(&strucpp::SHARED); p.run(); return strucpp::SHARED.with_lock([](auto* value){ return value->FIRST == 3 && value->SECOND == 4; }) ? 0 : 1; }\n`,
+    );
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `func_output_whole_composite_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+        execSync(`"${out}"`, { stdio: 'pipe' });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++/run ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
+  it('compiles shared function results, EN/ENO, nested output calls, and test wrappers', () => {
+    const source = `
+      TYPE ResultData : STRUCT value : INT; END_STRUCT END_TYPE
+
+      FUNCTION MakeValue : INT
+        VAR_OUTPUT out : INT; END_VAR
+        out := 7;
+        MakeValue := 7;
+      END_FUNCTION
+
+      FUNCTION AddWithOutput : INT
+        VAR_INPUT x : INT; END_VAR
+        VAR_OUTPUT out : INT; END_VAR
+        out := x + 1;
+        AddWithOutput := x;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR_EXTERNAL shared : ResultData; enabled : BOOL; END_VAR
+        VAR result : INT; nested : INT; END_VAR
+        shared.value := MakeValue(EN := FALSE, ENO => enabled);
+        nested := AddWithOutput(x := 3, out => shared.value) + 1;
+        result := MakeValue(out => shared.value);
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        VAR_GLOBAL shared : ResultData; enabled : BOOL; END_VAR
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source, { isTestBuild: true });
+    expect(result.success).toBe(true);
+    expect(result.cppCode).toContain('MAKEVALUE_dispatch');
+    expect(result.cppCode).toContain('IEC_INT __function_arg_');
+    expect(result.cppCode).toContain('ADDWITHOUTPUT(');
+
+    const runtimeInclude = path.resolve(__dirname, '../../src/runtime/include');
+    const hpp = path.join(tempDir, 'generated.hpp');
+    const cpp = path.join(tempDir, 'func_result_edges.cpp');
+    fs.writeFileSync(hpp, result.headerCode);
+    fs.writeFileSync(
+      cpp,
+      `${result.cppCode}\n\nint main(){ strucpp::Program_MAIN p(&strucpp::SHARED, &strucpp::ENABLED); p.run(); return strucpp::SHARED.with_lock([](auto* value){ return value->VALUE; }) == 7 && !strucpp::ENABLED.read() ? 0 : 1; }\n`,
+    );
+
+    for (const threaded of [false, true]) {
+      const flag = threaded ? '-DSTRUCPP_THREADED' : '';
+      const out = path.join(tempDir, `func_result_edges_${threaded}.out`);
+      let ok = true;
+      let diag = '';
+      try {
+        execSync(`g++ -std=c++17 ${flag} -I"${runtimeInclude}" "${cpp}" -o "${out}"`, {
+          stdio: 'pipe',
+        });
+        execSync(`"${out}"`, { stdio: 'pipe' });
+      } catch (e) {
+        ok = false;
+        diag = (e as { stderr?: Buffer }).stderr?.toString() ?? String(e);
+      }
+      expect(ok, `g++/run ${threaded ? 'threaded' : 'non-threaded'} failed:\n${diag}`).toBe(true);
+    }
+  });
+
+  it('compiles omitted output temporaries in repeat conditions and inline arrays', () => {
+    const source = `
+      FUNCTION Ready : BOOL
+        VAR_OUTPUT value : INT; END_VAR
+        value := 1;
+        Ready := TRUE;
+      END_FUNCTION
+
+      FUNCTION Fill : BOOL
+        VAR_OUTPUT values : ARRAY[1..2] OF INT; END_VAR
+        values[1] := 1;
+        values[2] := 2;
+        Fill := TRUE;
+      END_FUNCTION
+
+      PROGRAM Main
+        VAR done : BOOL; END_VAR
+        REPEAT
+          done := Ready();
+        UNTIL done
+        END_REPEAT;
+        Fill();
+      END_PROGRAM
+
+      CONFIGURATION Cfg
+        RESOURCE Res ON PLC
+          TASK task0(INTERVAL := T#10ms, PRIORITY := 1);
+          PROGRAM inst WITH task0 : Main;
+        END_RESOURCE
+      END_CONFIGURATION
+    `;
+    const result = compile(source);
+    expect(result.success).toBe(true);
+
+    const cppResult = compileWithGpp(result.headerCode, result.cppCode, 'func_output_temp_edges');
+    expect(cppResult.success).toBe(true);
+  });
+
   // Nested comment syntax-only tests removed — comments are exercised
   // by all st-validation tests. Error case kept below.
 

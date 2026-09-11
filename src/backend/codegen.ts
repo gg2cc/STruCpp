@@ -97,6 +97,22 @@ interface LocatedVarDescriptor {
   programName: string;
 }
 
+interface FunctionParamInfo {
+  name: string;
+  typeName: string;
+  type: VarDeclaration["type"];
+  blockType: string;
+  defaultExpr?: string;
+}
+
+interface PreparedFunctionCall {
+  functionName: string;
+  returnType: string;
+  args: string[];
+  declarations: string[];
+  writebacks: Array<{ target: Expression; source: string }>;
+}
+
 /**
  * Parse a located variable address and return descriptor info.
  */
@@ -2304,7 +2320,11 @@ export class CodeGenerator {
   ): string[] {
     const names: string[] = [];
     for (const block of func.varBlocks) {
-      if (block.blockType === "VAR_INPUT" || block.blockType === "VAR_IN_OUT") {
+      if (
+        block.blockType === "VAR_INPUT" ||
+        block.blockType === "VAR_IN_OUT" ||
+        block.blockType === "VAR_OUTPUT"
+      ) {
         for (const decl of block.declarations) {
           for (const name of decl.names) {
             names.push(name);
@@ -2978,11 +2998,20 @@ export class CodeGenerator {
               ...stmt.call,
               arguments: filteredArgs,
             };
-            const callExpr = this.generateFunctionCallExpression(modifiedCall);
             this.emitEnEnoWrapper(indent, enExpr, enoVar, (bi) => {
-              this.emit(`${bi}${callExpr};`);
+              if (!this.generateUserFunctionCallStatement(modifiedCall, bi)) {
+                const callExpr =
+                  this.generateFunctionCallExpression(modifiedCall);
+                this.emit(`${bi}${callExpr};`);
+              }
             });
           } else {
+            if (
+              stmt.call.kind === "FunctionCallExpression" &&
+              this.generateUserFunctionCallStatement(stmt.call, indent)
+            ) {
+              break;
+            }
             this.emit(`${indent}${this.generateExpression(stmt.call)};`);
           }
         }
@@ -3064,6 +3093,40 @@ export class CodeGenerator {
       return;
     }
 
+    // EN/ENO on function call assignment to a shared global target must be
+    // handled before the generic shared-global write path below.
+    if (
+      stmt.value.kind === "FunctionCallExpression" &&
+      this.hasEnEno(stmt.value.arguments) &&
+      this.isSharedGlobalTarget(stmt.target)
+    ) {
+      const { enExpr, enoVar, filteredArgs } = this.extractEnEno(
+        stmt.value.arguments,
+      );
+      const modifiedCall: FunctionCallExpression = {
+        ...stmt.value,
+        arguments: filteredArgs,
+      };
+      const preparedCall = this.prepareUserFunctionCall(modifiedCall);
+      if (preparedCall) {
+        this.emitPreparedFunctionCallDeclarations(preparedCall, indent);
+      }
+      this.emitEnEnoWrapper(indent, enExpr, enoVar, (bi) => {
+        if (preparedCall) {
+          const result = `__function_result_${this.tempVarCounter++}`;
+          this.emit(
+            `${bi}${preparedCall.returnType} ${result} = ${modifiedCall.functionName}(${preparedCall.args.join(", ")});`,
+          );
+          this.emitFunctionCallWritebacks(preparedCall, bi);
+          this.emitCaptureToLvalue(stmt.target, result, bi);
+        } else {
+          const callExpr = this.generateFunctionCallExpression(modifiedCall);
+          this.emitCaptureToLvalue(stmt.target, callExpr, bi);
+        }
+      });
+      return;
+    }
+
     // Composite / array shared-global WRITE (VAR_EXTERNAL to a composite
     // VAR_GLOBAL): take the global's own mutex and write the canonical directly
     // through with_lock. The RHS is computed into a temp first, so any
@@ -3121,16 +3184,42 @@ export class CodeGenerator {
       const { enExpr, enoVar, filteredArgs } = this.extractEnEno(
         stmt.value.arguments,
       );
-      const target = this.generateExpression(stmt.target);
       const modifiedCall: FunctionCallExpression = {
         ...stmt.value,
         arguments: filteredArgs,
       };
-      const callExpr = this.generateFunctionCallExpression(modifiedCall);
+      const preparedCall = this.prepareUserFunctionCall(modifiedCall);
+      if (preparedCall) {
+        this.emitPreparedFunctionCallDeclarations(preparedCall, indent);
+      }
       this.emitEnEnoWrapper(indent, enExpr, enoVar, (bi) => {
-        this.emit(`${bi}${target} = ${callExpr};`);
+        if (preparedCall) {
+          const result = `__function_result_${this.tempVarCounter++}`;
+          this.emit(
+            `${bi}${preparedCall.returnType} ${result} = ${modifiedCall.functionName}(${preparedCall.args.join(", ")});`,
+          );
+          this.emitFunctionCallWritebacks(preparedCall, bi);
+          this.emitCaptureToLvalue(stmt.target, result, bi);
+        } else {
+          const callExpr = this.generateFunctionCallExpression(modifiedCall);
+          this.emitCaptureToLvalue(stmt.target, callExpr, bi);
+        }
       });
       return;
+    }
+
+    if (stmt.value.kind === "FunctionCallExpression") {
+      const preparedCall = this.prepareUserFunctionCall(stmt.value);
+      if (preparedCall) {
+        this.emitPreparedFunctionCallDeclarations(preparedCall, indent);
+        const result = `__function_result_${this.tempVarCounter++}`;
+        this.emit(
+          `${indent}${preparedCall.returnType} ${result} = ${stmt.value.functionName}(${preparedCall.args.join(", ")});`,
+        );
+        this.emitFunctionCallWritebacks(preparedCall, indent);
+        this.emitCaptureToLvalue(stmt.target, result, indent);
+        return;
+      }
     }
 
     // VAR_EXTERNAL scalar write → lock the shared global and set its value via
@@ -3463,6 +3552,7 @@ export class CodeGenerator {
    * ST: REPEAT ... UNTIL condition → C++: do { ... } while (!(condition))
    */
   private generateRepeatStatement(stmt: RepeatStatement, indent: string): void {
+    const condition = this.generateExpression(stmt.condition);
     const doLine = this.currentLine;
     this.emit(`${indent}do {`);
     this.recordLineMapping(stmt.sourceSpan.startLine, doLine);
@@ -3475,9 +3565,7 @@ export class CodeGenerator {
     this.loopExitLabelStack.pop();
     this.emitLineDirective(stmt.sourceSpan.endLine);
     const untilLine = this.currentLine;
-    this.emit(
-      `${indent}} while (!(${this.generateExpression(stmt.condition)}));`,
-    );
+    this.emit(`${indent}} while (!(${condition}));`);
     if (exitLabel.used) this.emit(`${indent}${exitLabel.name}: ;`);
     this.recordLineMapping(stmt.sourceSpan.endLine, untilLine);
   }
@@ -4579,6 +4667,11 @@ export class CodeGenerator {
 
     // 3. Check for named arguments that may need reordering
     const hasNamedArgs = expr.arguments.some((arg) => arg.name !== undefined);
+    const preparedExpression = this.generateUserFunctionCallExpression(expr);
+    if (preparedExpression !== null) {
+      return preparedExpression;
+    }
+
     if (hasNamedArgs && this.ast) {
       const reordered = this.reorderNamedArguments(expr);
       if (reordered) {
@@ -4606,7 +4699,11 @@ export class CodeGenerator {
         (f) => f.name.toUpperCase() === nameUpper,
       );
       if (funcDecl) {
-        const paramInfo: Array<{ blockType: string; typeName: string }> = [];
+        const paramInfo: Array<{
+          blockType: string;
+          typeName: string;
+          type: VarDeclaration["type"];
+        }> = [];
         for (const block of funcDecl.varBlocks) {
           if (
             block.blockType === "VAR_INPUT" ||
@@ -4618,6 +4715,7 @@ export class CodeGenerator {
                 paramInfo.push({
                   blockType: block.blockType,
                   typeName: decl.type.name,
+                  type: decl.type,
                 });
               }
             }
@@ -4629,7 +4727,7 @@ export class CodeGenerator {
             param.blockType === "VAR_OUTPUT" ||
             param.blockType === "VAR_IN_OUT"
           ) {
-            args.push(this.emitOutputTempVar(param.typeName));
+            args.push(this.emitOutputTempVar(param.type));
           } else {
             args.push(this.getTypeDefaultValue(param.typeName));
           }
@@ -4644,6 +4742,292 @@ export class CodeGenerator {
     }
 
     return `${expr.functionName}(${args.join(", ")})`;
+  }
+
+  /**
+   * Generate a user-defined function call statement when a VAR_OUTPUT or
+   * VAR_IN_OUT argument targets shared external storage. Such storage is
+   * accessed through with_lock(), whose result is a value rather than a C++
+   * lvalue reference. Use a local reference-compatible temporary and copy it
+   * back after the call instead of passing the with_lock result directly.
+   */
+  private generateUserFunctionCallStatement(
+    expr: FunctionCallExpression,
+    indent: string,
+  ): boolean {
+    const prepared = this.prepareUserFunctionCall(expr);
+    if (!prepared) return false;
+
+    this.emitPreparedFunctionCallDeclarations(prepared, indent);
+    this.emit(`${indent}${expr.functionName}(${prepared.args.join(", ")});`);
+    this.emitFunctionCallWritebacks(prepared, indent);
+    return true;
+  }
+
+  /**
+   * Prepare a user-defined function call with shared VAR_OUTPUT/VAR_IN_OUT
+   * targets. Returns null when no shared reference target is present so the
+   * existing expression codegen can handle the call unchanged.
+   */
+  private prepareUserFunctionCall(
+    expr: FunctionCallExpression,
+  ): PreparedFunctionCall | null {
+    if (!this.ast) return null;
+    const funcDecl = this.ast.functions.find(
+      (f) => f.name.toUpperCase() === expr.functionName.toUpperCase(),
+    );
+    if (!funcDecl) return null;
+
+    const params = this.getFunctionParamInfo(funcDecl);
+    const bindings = this.bindFunctionCallArguments(expr, params);
+    const sharedBindings = bindings.filter(
+      (binding) =>
+        binding.argument !== undefined &&
+        (binding.param.blockType === "VAR_OUTPUT" ||
+          binding.param.blockType === "VAR_IN_OUT") &&
+        this.isSharedGlobalTarget(binding.argument.value),
+    );
+    if (sharedBindings.length === 0) return null;
+
+    const args: string[] = [];
+    const declarations: string[] = [];
+    const writebacks: Array<{ target: Expression; source: string }> = [];
+    for (const binding of bindings) {
+      const { param, argument } = binding;
+      if (!argument) {
+        if (
+          param.blockType === "VAR_OUTPUT" ||
+          param.blockType === "VAR_IN_OUT"
+        ) {
+          const temp = `__output_tmp_${this.tempVarCounter++}`;
+          declarations.push(
+            `${this.mapTypeRefToCpp(this.toParamTypeRef(param.type))} ${temp};`,
+          );
+          args.push(temp);
+        } else {
+          args.push(
+            param.defaultExpr ?? this.getTypeDefaultValue(param.typeName),
+          );
+        }
+        continue;
+      }
+
+      if (argument.isOutput && argument.value.kind !== "VariableExpression") {
+        this.codegenWarnings.push({
+          message: `Output argument '${argument.name ?? ""}' should be a variable, not an expression`,
+          line: argument.sourceSpan.startLine,
+          column: argument.sourceSpan.startCol,
+          file: argument.sourceSpan.file,
+        });
+      }
+
+      if (
+        (param.blockType === "VAR_OUTPUT" ||
+          param.blockType === "VAR_IN_OUT") &&
+        this.isSharedGlobalTarget(argument.value)
+      ) {
+        const temp = `__function_arg_${this.tempVarCounter++}`;
+        const cppType = this.mapTypeRefToCpp(this.toParamTypeRef(param.type));
+        const initializer =
+          param.blockType === "VAR_IN_OUT"
+            ? ` = ${this.generateExpression(argument.value)}`
+            : "";
+        declarations.push(`${cppType} ${temp}${initializer};`);
+        args.push(temp);
+        writebacks.push({ target: argument.value, source: temp });
+      } else {
+        const generated = this.generateExpression(argument.value);
+        args.push(
+          param.blockType === "VAR_INPUT"
+            ? this.coerceSingleUserFuncArg(generated, argument, param.typeName)
+            : generated,
+        );
+      }
+    }
+
+    this.warnAboutFunctionCallBindings(expr, params);
+    return {
+      functionName: expr.functionName,
+      returnType: this.mapTypeRefToCpp(funcDecl.returnType),
+      args,
+      declarations,
+      writebacks,
+    };
+  }
+
+  private emitPreparedFunctionCallDeclarations(
+    call: PreparedFunctionCall,
+    indent: string,
+  ): void {
+    for (const declaration of call.declarations) {
+      this.emit(`${indent}${declaration}`);
+    }
+  }
+
+  private generateUserFunctionCallExpression(
+    expr: FunctionCallExpression,
+  ): string | null {
+    const prepared = this.prepareUserFunctionCall(expr);
+    if (!prepared) return null;
+
+    const result = `__function_result_${this.tempVarCounter++}`;
+    const body = [
+      ...prepared.declarations.map((declaration) => `    ${declaration}`),
+      `    ${prepared.returnType} ${result} = ${expr.functionName}(${prepared.args.join(", ")});`,
+      ...prepared.writebacks.map(
+        (writeback) =>
+          `    ${this.captureToLvalueCode(writeback.target, writeback.source)}`,
+      ),
+      `    return ${result};`,
+    ];
+    return `[&]() {\n${body.join("\n")}\n}()`;
+  }
+
+  private getFunctionParamInfo(
+    funcDecl: CompilationUnit["functions"][0],
+  ): FunctionParamInfo[] {
+    const params: FunctionParamInfo[] = [];
+    for (const block of funcDecl.varBlocks) {
+      if (
+        block.blockType !== "VAR_INPUT" &&
+        block.blockType !== "VAR_IN_OUT" &&
+        block.blockType !== "VAR_OUTPUT"
+      ) {
+        continue;
+      }
+      for (const decl of block.declarations) {
+        for (const name of decl.names) {
+          params.push({
+            name: name.toUpperCase(),
+            typeName: decl.type.name,
+            type: decl.type,
+            blockType: block.blockType,
+            ...(decl.initialValue
+              ? {
+                  defaultExpr: this.generateInitializer(
+                    decl.initialValue,
+                    this.mapTypeRefToCpp(decl.type),
+                    decl.type.name,
+                  ),
+                }
+              : {}),
+          });
+        }
+      }
+    }
+    return params;
+  }
+
+  private bindFunctionCallArguments(
+    expr: FunctionCallExpression,
+    params: FunctionParamInfo[],
+  ): Array<{ param: FunctionParamInfo; argument?: Argument }> {
+    const named = new Map<string, Argument>();
+    const claimed = new Set<string>();
+    const positional: Argument[] = [];
+    for (const argument of expr.arguments) {
+      if (argument.name !== undefined) {
+        const name = argument.name.toUpperCase();
+        if (name !== "EN" && name !== "ENO") {
+          named.set(name, argument);
+          claimed.add(name);
+        }
+      } else {
+        positional.push(argument);
+      }
+    }
+
+    let positionalIndex = 0;
+    return params.map((param) => {
+      if (named.has(param.name)) {
+        const argument = named.get(param.name)!;
+        return { param, argument };
+      }
+      if (claimed.has(param.name)) return { param };
+      const argument = positional[positionalIndex++];
+      return argument ? { param, argument } : { param };
+    });
+  }
+
+  private warnAboutFunctionCallBindings(
+    expr: FunctionCallExpression,
+    params: FunctionParamInfo[],
+  ): void {
+    const paramLookup = new Map(params.map((param) => [param.name, param]));
+    for (const argument of expr.arguments) {
+      if (argument.name === undefined) continue;
+      const name = argument.name.toUpperCase();
+      if (name === "EN" || name === "ENO") continue;
+      const param = paramLookup.get(name);
+      if (!param) {
+        this.codegenWarnings.push({
+          message: `Named argument '${name}' does not match any parameter of function '${expr.functionName}'`,
+          line: expr.sourceSpan.startLine,
+          column: expr.sourceSpan.startCol,
+          file: expr.sourceSpan.file,
+        });
+      } else if (argument.isOutput && param.blockType === "VAR_INPUT") {
+        this.codegenWarnings.push({
+          message: `Output argument '=>' used for input parameter '${param.name.toLowerCase()}' — did you mean ':='?`,
+          line: expr.sourceSpan.startLine,
+          column: expr.sourceSpan.startCol,
+          file: expr.sourceSpan.file,
+        });
+      }
+    }
+  }
+
+  private emitFunctionCallWritebacks(
+    call: PreparedFunctionCall,
+    indent: string,
+  ): void {
+    for (const writeback of call.writebacks) {
+      this.emitCaptureToLvalue(writeback.target, writeback.source, indent);
+    }
+  }
+
+  private captureToLvalueCode(target: Expression, source: string): string {
+    if (
+      target.kind === "VariableExpression" &&
+      !target.isDereference &&
+      this.compositeExternals.has(target.name.toUpperCase())
+    ) {
+      const ptr = this.resolveVariableBaseName(target.name);
+      const lv = this.renderAccessTail(
+        "(*__glk)",
+        target,
+        target.name.toUpperCase(),
+      );
+      return `${ptr}->with_lock([&](auto* __glk){ ${lv} = ${source}; });`;
+    }
+    if (
+      target.kind === "VariableExpression" &&
+      target.fieldAccess.length === 0 &&
+      !target.isDereference &&
+      this.programExternals.has(target.name.toUpperCase())
+    ) {
+      return `${target.name}->write(${source});`;
+    }
+    return `${this.generateExpression(target)} = ${source};`;
+  }
+
+  private coerceSingleUserFuncArg(
+    generated: string,
+    argument: Argument,
+    paramType: string,
+  ): string {
+    const args = [generated];
+    this.coerceUserFuncArgs(args, [argument], [paramType]);
+    return args[0]!;
+  }
+
+  private isSharedGlobalTarget(expr: Expression): expr is VariableExpression {
+    if (expr.kind !== "VariableExpression" || expr.isDereference) return false;
+    const nameUpper = expr.name.toUpperCase();
+    return (
+      this.compositeExternals.has(nameUpper) ||
+      (expr.fieldAccess.length === 0 && this.programExternals.has(nameUpper))
+    );
   }
 
   /**
@@ -4665,6 +5049,7 @@ export class CodeGenerator {
     const params: Array<{
       name: string;
       typeName: string;
+      type: VarDeclaration["type"];
       blockType: string;
       defaultExpr?: string;
     }> = [];
@@ -4679,11 +5064,13 @@ export class CodeGenerator {
             const entry: {
               name: string;
               typeName: string;
+              type: VarDeclaration["type"];
               blockType: string;
               defaultExpr?: string;
             } = {
               name: name.toUpperCase(),
               typeName: decl.type.name,
+              type: decl.type,
               blockType: block.blockType,
             };
             if (decl.initialValue) {
@@ -4791,7 +5178,7 @@ export class CodeGenerator {
           param.blockType === "VAR_OUTPUT" ||
           param.blockType === "VAR_IN_OUT"
         ) {
-          result[i] = this.emitOutputTempVar(param.typeName);
+          result[i] = this.emitOutputTempVar(param.type);
         } else {
           result[i] =
             param.defaultExpr ?? this.getTypeDefaultValue(param.typeName);
@@ -4806,7 +5193,7 @@ export class CodeGenerator {
         param.blockType === "VAR_OUTPUT" ||
         param.blockType === "VAR_IN_OUT"
       ) {
-        return this.emitOutputTempVar(param.typeName);
+        return this.emitOutputTempVar(param.type);
       }
       return param.defaultExpr ?? this.getTypeDefaultValue(param.typeName);
     });
@@ -4821,10 +5208,14 @@ export class CodeGenerator {
    * The temp is emitted before the current statement line (since generateExpression()
    * runs before the statement's emit() call). Returns the temp variable name.
    */
-  private emitOutputTempVar(typeName: string): string {
+  private emitOutputTempVar(
+    type: string | VarDeclaration["type"],
+    indent = this.currentStatementIndent,
+  ): string {
     const name = `__output_tmp_${this.tempVarCounter++}`;
-    const cppType = this.mapVarTypeToCpp(typeName);
-    this.emit(`${this.currentStatementIndent}${cppType} ${name};`);
+    const typeRef = typeof type === "string" ? { name: type } : type;
+    const cppType = this.mapTypeRefToCpp(this.toParamTypeRef(typeRef));
+    this.emit(`${indent}${cppType} ${name};`);
     return name;
   }
 
@@ -5189,11 +5580,11 @@ export class CodeGenerator {
    */
   private extractEnEno(args: Argument[]): {
     enExpr: string | null;
-    enoVar: string | null;
+    enoVar: Expression | null;
     filteredArgs: Argument[];
   } {
     let enExpr: string | null = null;
-    let enoVar: string | null = null;
+    let enoVar: Expression | null = null;
     const filteredArgs: Argument[] = [];
 
     for (const arg of args) {
@@ -5201,7 +5592,7 @@ export class CodeGenerator {
       if (nameUpper === "EN" && !arg.isOutput) {
         enExpr = this.generateExpression(arg.value);
       } else if (nameUpper === "ENO" && arg.isOutput) {
-        enoVar = this.generateExpression(arg.value);
+        enoVar = arg.value;
       } else {
         filteredArgs.push(arg);
       }
@@ -5239,16 +5630,16 @@ export class CodeGenerator {
   private emitEnEnoWrapper(
     indent: string,
     enExpr: string | null,
-    enoVar: string | null,
+    enoVar: Expression | null,
     emitBody: (bodyIndent: string) => void,
     instanceEnoTarget: string | null = null,
   ): void {
-    const targets = [enoVar, instanceEnoTarget].filter(
-      (t): t is string => t !== null,
-    );
     const writeTargets = (atIndent: string, value: boolean): void => {
-      for (const t of targets) {
-        this.emit(`${atIndent}${t} = ${value};`);
+      if (enoVar !== null) {
+        this.emitCaptureToLvalue(enoVar, value ? "true" : "false", atIndent);
+      }
+      if (instanceEnoTarget !== null) {
+        this.emit(`${atIndent}${instanceEnoTarget} = ${value};`);
       }
     };
 
@@ -5392,36 +5783,7 @@ export class CodeGenerator {
     source: string,
     indent: string,
   ): void {
-    if (
-      target.kind === "VariableExpression" &&
-      !target.isDereference &&
-      this.compositeExternals.has(target.name.toUpperCase())
-    ) {
-      const ptr = this.resolveVariableBaseName(target.name);
-      const lv = this.renderAccessTail(
-        "(*__glk)",
-        target,
-        target.name.toUpperCase(),
-      );
-      this.emit(
-        `${indent}${ptr}->with_lock([&](auto* __glk){ ${lv} = ${source}; });`,
-      );
-      return;
-    }
-    // Scalar VAR_EXTERNAL capture → the shared global is a pointer, so its value
-    // is read via `->read()` (an rvalue) and written via `->write()`. Assigning
-    // to `->read()` fails to compile, so route the write through the pointer,
-    // mirroring the scalar-external branch of generateAssignmentStatement.
-    if (
-      target.kind === "VariableExpression" &&
-      target.fieldAccess.length === 0 &&
-      !target.isDereference &&
-      this.programExternals.has(target.name.toUpperCase())
-    ) {
-      this.emit(`${indent}${target.name}->write(${source});`);
-      return;
-    }
-    this.emit(`${indent}${this.generateExpression(target)} = ${source};`);
+    this.emit(`${indent}${this.captureToLvalueCode(target, source)}`);
   }
 
   /**
